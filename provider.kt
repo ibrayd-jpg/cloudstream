@@ -1,188 +1,197 @@
-package com.hexated
+package com.lagradost.cloudstream3.plugins
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.mvvm.safeApiCall
+import org.jsoup.nodes.Element
+import java.net.URLDecoder
 
-class HdTodayProvider : MainAPI() {
-    override var mainUrl = "https://hdtoday.fun"
+class HDTodayProvider : MainAPI() {
+    override var mainUrl = "https://hdtoday.tv" // veya hdtoday.fun
     override var name = "HDToday"
-    override var lang = "en"
+    override val hasQuickSearch = false
     override val hasMainPage = true
-    override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    override val mainPage = mainPageOf(
-        "$mainUrl/movies/" to "Movies",
-        "$mainUrl/tvshows/" to "TV Shows",
-        "$mainUrl/trending/" to "Trending",
-    )
-
+    // 1. Ana sayfadaki filmler (örnek: popular / latest)
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data}page/$page/"
-        val doc = Jsoup.connect(url).get()
-        
-        val items = doc.select("article.item, div.item").map { element ->
-            val titleElement = element.selectFirst("h2.title a, h3.title a, a.title")
-            val title = titleElement?.text()?.trim() ?: ""
-            val href = titleElement?.attr("href") ?: ""
-            val posterElement = element.selectFirst("img")
-            val poster = posterElement?.attr("data-src") 
-                ?: posterElement?.attr("src") 
-                ?: ""
-            
-            newMovieSearchResponse(title, href, TvType.Movie) {
-                this.posterUrl = fixUrl(poster)
-            }
-        }
-        
-        val nextPage = if (doc.select("a.next").isNotEmpty()) page + 1 else null
-        return newHomePageResponse(request.name, items, nextPage)
+        val document = app.get("$mainUrl/page/$page").document
+
+        val items = document.select("div.movie-item, .item-post") // site HTML’ine göre düzenle
+            .mapNotNull { it.toSearchResult() }
+
+        return newHomePageResponse(
+            listOf(HomePageList("Latest Movies", items)),
+            hasNext = page < 20 // sayfa sınırlıysa
+        )
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val doc = Jsoup.connect("$mainUrl/?s=$query").get()
-        
-        return doc.select("article.item, div.item").map { element ->
-            val titleElement = element.selectFirst("h2.title a, h3.title a, a.title")
-            val title = titleElement?.text()?.trim() ?: ""
-            val href = titleElement?.attr("href") ?: ""
-            val posterElement = element.selectFirst("img")
-            val poster = posterElement?.attr("data-src") 
-                ?: posterElement?.attr("src") 
-                ?: ""
-            
-            val isTvSeries = href.contains("/tvshows/") || 
-                element.select("span.tv, span.series").isNotEmpty()
-            
-            newMovieSearchResponse(title, href, if (isTvSeries) TvType.TvSeries else TvType.Movie) {
-                this.posterUrl = fixUrl(poster)
-            }
+    // 2. HTML öğesini SearchResponse’a çevir
+    private fun Element.toSearchResult(): SearchResponse? {
+        val id = this.selectFirst("a[href*="/movie/"]")?.attr("href")
+            ?: this.selectFirst("a[href*="/tv/"]")?.attr("href") ?: return null
+
+        val title = this.selectFirst(".title, .movie-title")?.text().trim()
+            ?: this.selectFirst("a[href*="/movie/"]")?.attr("title")
+            ?: this.selectFirst("a[href*="/tv/"]")?.text().trim()
+            ?: return null
+
+        val poster = this.selectFirst("img[src]")?.attr("src")?.let { fixUrl(it) }
+
+        return newMovieSearchResponse(
+            title,
+            id, // URL’nin son kısmı
+            if (id.contains("/tv/")) TvType.TvSeries else TvType.Movie
+        ).also {
+            it.posterUrl = poster
         }
     }
 
+    // 3. Arama (isteğe bağlı; site API kullanıyorsa)
+    override suspend fun search(query: String): ArrayList<SearchResponse> {
+        val res = ArrayList<SearchResponse>()
+        val encoded = query.encodeToUrlComponent()
+        val document = app.get("$mainUrl/search?keyword=$encoded").document
+
+        document.select("div.movie-item, .item-post") // aynı CSS seçici
+            .mapNotNull { it.toSearchResult() }
+            .forEach { res.add(it) }
+
+        return res
+    }
+
+    // 4. Film sayfası → oynatma linkleri
     override suspend fun load(url: String): LoadResponse {
-        val doc = Jsoup.connect(url).get()
-        
-        val title = doc.selectFirst("h1.title, h1.entry-title, h1[itemprop=name]")?.text()?.trim() ?: ""
-        val poster = doc.selectFirst("img.poster, img.attachment-post-thumbnail")?.let {
-            it.attr("data-src").ifEmpty { it.attr("src") }
-        } ?: ""
-        
-        val description = doc.selectFirst("div.description, div.entry-content, div[itemprop=description]")?.text()?.trim()
-        val year = doc.selectFirst("span.year, span.release-date, meta[itemprop=dateCreated]")?.let {
-            it.text().trim().substringBefore("-").trim()
-        }?.toIntOrNull()
-        
-        val tags = doc.select("span.genre a, a.genre, span.category a").map { it.text().trim() }
-        
-        val type = if (url.contains("/tvshows/")) TvType.TvSeries else TvType.Movie
-        
-        return if (type == TvType.TvSeries) {
-            val episodes = doc.select("ul.episodes li, div.seasons div.episode, div.episodes-list a").map { ep ->
-                val epTitle = ep.selectFirst("span.title, span.ep-title")?.text()?.trim() ?: ""
-                val epUrl = ep.selectFirst("a")?.attr("href") ?: ""
-                
-                val seasonEpisode = extractSeasonEpisode(ep.text(), epTitle)
-                Episode(epUrl, seasonEpisode?.second ?: epTitle, seasonEpisode?.first)
-            }
-            
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = fixUrl(poster)
-                this.plot = description
-                this.tags = tags
-                this.year = year
+        val fullUrl = fixUrlReturn(url)
+        val document = app.get(fullUrl).document
+
+        val title = document.selectFirst("h1, .movie-title")?.text().trim()
+            ?: throw ErrorLoadingException("Title not found")
+
+        val poster = document.selectFirst("img.poster, .movie-img")?.attr("src")
+            ?.let { fixUrl(it) }
+
+        val yearText = document.selectFirst(".year")?.text()
+            ?.trim()
+            ?.let { Regex("""d{4}""").find(it)?.value }?.toIntOrNull()
+
+        val isTv = url.contains("/tv/")
+
+        return if (isTv) {
+            val episodes = mutableListOf<Episode>()
+            document.select("div.episode-item, .episode") // seçici site HTML’ine göre
+                .forEach { epElem ->
+                    val epUrl = epElem.selectFirst("a[href]")?.attr("href") ?: return@forEach
+                    val epName = epElem.selectFirst(".title, .ep-name")?.text()?.trim()
+                        ?: "Episode ${episodes.size + 1}"
+
+                    val epNum = Regex("""d+""").find(epName)?.value?.toIntOrNull()
+
+                    episodes.add(
+                        Episode(
+                            url = epUrl,
+                            name = epName,
+                            season = 1, // site yapıya göre sezonlar varsa ayrıştır
+                            episode = epNum ?: episodes.size + 1
+                        )
+                    )
+                }
+
+            newTvSeriesLoadResponse(
+                title,
+                url,
+                TvType.TvSeries,
+                episodes
+            ).also {
+                it.year = yearText
+                it.posterUrl = poster
             }
         } else {
-            newMovieLoadResponse(title, url, TvType.Movie, url) {
-                this.posterUrl = fixUrl(poster)
-                this.plot = description
-                this.tags = tags
-                this.year = year
+            newMovieLoadResponse(
+                title,
+                url,
+                TvType.Movie,
+                url = fullUrl
+            ).also {
+                it.year = yearText
+                it.posterUrl = poster
             }
         }
     }
 
+    // 5. Video linkini çıkar (cloudflare, script, vs. varsa)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = Jsoup.connect(data).get()
-        
-        // Iframe'leri bul
-        doc.select("iframe").forEach { iframe ->
-            val src = iframe.attr("data-src").ifEmpty { iframe.attr("src") }
-            if (src.isNotBlank()) {
-                loadExtractor(src, data, subtitleCallback, callback)
+        val document = app.get(data).document
+
+        // Örnek: video iframe / direct mp4 / .m3u8
+        var url: String? = null
+
+        // .m3u8 / adaptive stream
+        document.select("video source[src*=".m3u8"]")
+            .mapNotNull { it.attr("src") }
+            .firstOrNull()
+            ?.let {
+                url = it
             }
-        }
-        
-        // Video kaynaklarını bul (player bölümünde)
-        doc.select("div.player-container script, script").forEach { script ->
-            val html = script.html()
-            // video URL pattern'lerini ara
-            val patterns = listOf(
-                """"file":"([^"]+)"""",
-                """file:\s*"([^"]+)"""",
-                """source:\s*"([^"]+)"""",
-                """videoUrl:\s*"([^"]+)"""",
-                """"src":"([^"]+\.mp4[^"]*)"""",
-                """src:\s*"([^"]+\.mp4[^"]*)"""",
-            )
-            
-            patterns.forEach { pattern ->
-                Regex(pattern).findAll(html).forEach { match ->
-                    val videoUrl = match.groupValues[1]
-                    Quality.fromUrl(videoUrl)?.let { quality ->
-                        callback(
-                            ExtractorLink(
-                                name,
-                                name,
-                                videoUrl,
-                                data,
-                                quality,
-                                true
-                            )
-                        )
-                    }
+
+        // Veya direkt mp4
+        if (url == null) {
+            document.select("video source[src*=".mp4"]")
+                .mapNotNull { it.attr("src") }
+                .firstOrNull()
+                ?.let {
+                    url = it
                 }
-            }
         }
-        
+
+        // Eğer iframe içinden link çıkıyorsa (örnek: <iframe src=".../embed?url=...") burayı genişlet
+        // Burada sade bir durum varsayalım:
+        if (url != null) {
+            callback.invoke(
+                ExtractorLink(
+                    source = name,
+                    name = "HDToday",
+                    url = fixUrlReturn(url!!),
+                    type = if (url!!.contains(".m3u8")) ExtractorLinkType.HLS else ExtractorLinkType.M3U8, // HLS/MP4
+                    quality = Qualities.Unknown.value,
+                    headers = mapOf("Referer" to data)
+                )
+            )
+            return true
+        }
+
+        // Alternatif: iframe varsa içine girip url çıkar
+        document.select("iframe[src]").mapNotNull { iframe ->
+            val iframeUrl = iframe.attr("src")
+            val iframeDoc = app.get(iframeUrl).document
+
+            iframeDoc.select("video source[src*=".m3u8"], video source[src*=".mp4"]")
+                .mapNotNull { src -> src.attr("src") }
+                .firstOrNull()
+                ?.let {
+                    callback.invoke(
+                        ExtractorLink(
+                            source = name,
+                            name = "HDToday ($iframeUrl)",
+                            url = fixUrlReturn(it),
+                            type = if (it.contains(".m3u8")) ExtractorLinkType.HLS else ExtractorLinkType.M3U8,
+                            quality = Qualities.Unknown.value,
+                            headers = mapOf("Referer" to iframeUrl)
+                        )
+                    )
+                }
+        }
+
         return true
     }
 
-    private fun Quality.Companion.fromUrl(url: String): Int? {
-        return when {
-            url.contains("1080") -> 1080
-            url.contains("720") -> 720
-            url.contains("480") -> 480
-            url.contains("360") -> 360
-            else -> Qualities.Unknown.value
-        }
-    }
-
-    private fun extractSeasonEpisode(text: String, title: String): Pair<Int?, String?>? {
-        val patterns = listOf(
-            Regex("""Season\s*(\d+)\s*Episode\s*(\d+)""", RegexOption.IGNORE_CASE),
-            Regex("""S(\d+)[\s-]*E(\d+)""", RegexOption.IGNORE_CASE),
-            Regex("""(\d+)x(\d+)"""),
-            Regex("""Episode\s*(\d+)"""),
-        )
-        
-        patterns.forEach { pattern ->
-            pattern.find(text.plus(" ").plus(title))?.let {
-                val groups = it.groupValues
-                if (groups.size == 3) {
-                    return Pair(groups[1].toIntOrNull(), groups[2].toIntOrNull())
-                } else if (groups.size == 2) {
-                    return Pair(1, groups[1].toIntOrNull())
-                }
-            }
-        }
-        return null
+    // 6. Helper: URL düzeltme
+    private fun fixUrlReturn(url: String): String {
+        return if (url.startsWith("http")) url else "$mainUrl$url"
     }
 }
