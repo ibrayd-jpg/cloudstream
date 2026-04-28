@@ -1,0 +1,12 @@
+{
+  "name": "HDToday Eklentisi",
+  "description": "HDToday film ve dizi eklentisi",
+  "author": "ibrayd-jpg",
+  "plugins": [
+    {
+      "name": "HDToday",
+      "file": "provider.kt",
+      "type": "site"
+    }
+  ]
+}
